@@ -1,164 +1,237 @@
 // Sentinel — fraud detection serving layer.
 //
-// Day 3 Phase C: load the model, run two hardcoded test transactions
-// through it (one known-fraud, one known-legit), print the fraud
-// probabilities. These must match Python's predictions exactly.
-//
-// Expected output:
-//   Fraud transaction:  P(fraud) = 0.9998  (Python: 0.999861)
-//   Legit transaction:  P(fraud) = 0.0001  (Python: 0.000085)
+// Day 4: HTTP server with /predict endpoint.
+// One ONNX session shared across requests, mutex-protected.
+// Loads the threshold config from Day 2 to make business decisions.
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	ort "github.com/yalue/onnxruntime_go"
 )
 
 const (
-	onnxRuntimeLib = "../../onnxruntime/libonnxruntime.dylib"
-	modelPath      = "../../models/fraud_model.onnx"
+	onnxRuntimeLib   = "../../onnxruntime/libonnxruntime.dylib"
+	modelPath        = "../../models/fraud_model.onnx"
+	thresholdCfgPath = "../../models/threshold_config.json"
+	numFeatures      = 30
+	httpAddr         = ":8080"
 )
 
-// One real fraud transaction from our test set, in feature order f0..f29.
-// (Same row Python predicted 0.999861 on.)
-var fraudTransaction = []float32{
-	57007.000000, -1.271244, 2.462675, -2.851395, 2.324480,
-	-1.372245, -0.948196, -3.065234, 1.166927, -2.268771,
-	-4.881143, 2.255147, -4.686387, 0.652375, -6.174288,
-	0.594380, -4.849692, -6.536521, -3.119094, 1.715494,
-	0.560478, 0.652941, 0.081931, -0.221348, -0.523582,
-	0.224228, 0.756335, 0.632800, 0.250187, 0.010000,
+// ThresholdConfig matches the JSON written by ml/03_threshold.py.
+type ThresholdConfig struct {
+	OptimalThreshold   float64 `json:"optimal_threshold"`
+	CostFN             int     `json:"cost_fn"`
+	CostFP             int     `json:"cost_fp"`
+	ExpectedRecall     float64 `json:"expected_recall"`
+	ExpectedPrecision  float64 `json:"expected_precision"`
 }
 
-// One real legit transaction. (Python predicted 0.000085.)
-var legitTransaction = []float32{
-	160760.000000, -0.674466, 1.408105, -1.110622, -1.328366,
-	1.388996, -1.308439, 1.885879, -0.614233, 0.311652,
-	0.650757, -0.857785, -0.229961, -0.199817, 0.266371,
-	-0.046544, -0.741398, -0.605617, -0.392568, -0.162648,
-	0.394322, 0.080084, 0.810034, -0.224327, 0.707899,
-	-0.135837, 0.045102, 0.533837, 0.291319, 23.000000,
+// PredictRequest is what clients POST. 30 floats in feature order f0..f29.
+type PredictRequest struct {
+	Features []float32 `json:"features"`
 }
 
-const numFeatures = 30
+// PredictResponse is what we return.
+type PredictResponse struct {
+	FraudProbability float32 `json:"fraud_probability"`
+	PredictedClass   int64   `json:"predicted_class"`
+	Decision         string  `json:"decision"`          // "allow" or "block"
+	ThresholdUsed    float64 `json:"threshold_used"`
+	LatencyMicros    int64   `json:"latency_us"`
+}
+
+// Server holds the long-lived ONNX session and the tensors it writes into.
+// The mutex prevents two HTTP handlers from clobbering each other's tensors.
+// (Day 5 will replace this with a pool of sessions for parallel throughput.)
+type Server struct {
+	mu       sync.Mutex
+	session  *ort.AdvancedSession
+	input    *ort.Tensor[float32]
+	label    *ort.Tensor[int64]
+	proba    *ort.Tensor[float32]
+	threshold float64
+
+	// metrics
+	totalRequests atomic.Uint64
+	totalAllow    atomic.Uint64
+	totalBlock    atomic.Uint64
+	totalErrors   atomic.Uint64
+	startedAt     time.Time
+}
 
 func main() {
-	// 1. Boot the runtime (same as Phase B).
+	// 1. Load the threshold config (the 0.41 cost-optimal threshold from Day 2).
+	cfg, err := loadThresholdConfig(thresholdCfgPath)
+	if err != nil {
+		log.Fatalf("load threshold config: %v", err)
+	}
+	log.Printf("✓ Threshold config loaded: optimal=%.3f (recall=%.3f precision=%.3f)",
+		cfg.OptimalThreshold, cfg.ExpectedRecall, cfg.ExpectedPrecision)
+
+	// 2. Boot ONNX Runtime (same as Day 3).
 	ort.SetSharedLibraryPath(onnxRuntimeLib)
 	if err := ort.InitializeEnvironment(); err != nil {
 		log.Fatalf("init onnxruntime: %v", err)
 	}
 	defer ort.DestroyEnvironment()
-
 	log.Println("✓ ONNX Runtime initialized")
 
-	// 2. Create one shared input tensor of shape (1, 30) — a batch of 1.
-	//    We'll reuse this tensor for both predictions by overwriting its data.
-	inputShape := ort.NewShape(1, numFeatures)
-	inputTensor, err := ort.NewEmptyTensor[float32](inputShape)
+	// 3. Create the long-lived tensors + session (also same as Day 3).
+	input, err := ort.NewEmptyTensor[float32](ort.NewShape(1, numFeatures))
 	if err != nil {
 		log.Fatalf("create input tensor: %v", err)
 	}
-	defer inputTensor.Destroy()
+	defer input.Destroy()
 
-	// 3. The two model outputs we saw in Phase B:
-	//    output[0] = "label"          shape (1,)   — predicted class (int64)
-	//    output[1] = "probabilities"  shape (1, 2) — [P(legit), P(fraud)]
-	labelTensor, err := ort.NewEmptyTensor[int64](ort.NewShape(1))
+	label, err := ort.NewEmptyTensor[int64](ort.NewShape(1))
 	if err != nil {
 		log.Fatalf("create label tensor: %v", err)
 	}
-	defer labelTensor.Destroy()
+	defer label.Destroy()
 
-	probaTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(1, 2))
+	proba, err := ort.NewEmptyTensor[float32](ort.NewShape(1, 2))
 	if err != nil {
 		log.Fatalf("create probability tensor: %v", err)
 	}
-	defer probaTensor.Destroy()
+	defer proba.Destroy()
 
-	// 4. Create an inference session bound to those tensors.
 	session, err := ort.NewAdvancedSession(
 		modelPath,
-		[]string{"input"},                       // input tensor names (must match ONNX schema)
-		[]string{"label", "probabilities"},      // output tensor names
-		[]ort.ArbitraryTensor{inputTensor},      // input tensors
-		[]ort.ArbitraryTensor{labelTensor, probaTensor}, // output tensors
-		nil, // session options — defaults are fine for now
+		[]string{"input"},
+		[]string{"label", "probabilities"},
+		[]ort.ArbitraryTensor{input},
+		[]ort.ArbitraryTensor{label, proba},
+		nil,
 	)
 	if err != nil {
 		log.Fatalf("create session: %v", err)
 	}
 	defer session.Destroy()
-
 	log.Println("✓ Inference session ready")
 
-	// 5. Predict on the fraud transaction.
-	runPrediction("FRAUD transaction", fraudTransaction,
-		inputTensor, labelTensor, probaTensor, session, 0.999861)
+	// 4. Wire up the server.
+	s := &Server{
+		session:   session,
+		input:     input,
+		label:     label,
+		proba:     proba,
+		threshold: cfg.OptimalThreshold,
+		startedAt: time.Now(),
+	}
 
-	// 6. Predict on the legit transaction.
-	runPrediction("LEGIT transaction", legitTransaction,
-		inputTensor, labelTensor, probaTensor, session, 0.000085)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/predict", s.handlePredict)
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 
-	fmt.Println("\nDone.")
+	log.Printf("✓ Listening on http://localhost%s", httpAddr)
+	if err := http.ListenAndServe(httpAddr, mux); err != nil {
+		log.Fatalf("server: %v", err)
+	}
 }
 
-// runPrediction copies features into the input tensor, runs the model,
-// reads class + fraud probability, prints both and compares to Python.
-func runPrediction(
-	label string,
-	features []float32,
-	inputTensor *ort.Tensor[float32],
-	labelTensor *ort.Tensor[int64],
-	probaTensor *ort.Tensor[float32],
-	session *ort.AdvancedSession,
-	pythonProba float32,
-) {
-	if len(features) != numFeatures {
-		log.Fatalf("%s: expected %d features, got %d", label, numFeatures, len(features))
+func loadThresholdConfig(path string) (*ThresholdConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
+	}
+	var cfg ThresholdConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	return &cfg, nil
+}
+
+func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
 	}
 
-	// Copy features into the existing input tensor's backing slice.
-	copy(inputTensor.GetData(), features)
-
-	// Run the model. Outputs are written into labelTensor and probaTensor.
-	if err := session.Run(); err != nil {
-		log.Fatalf("%s: run failed: %v", label, err)
+	var req PredictRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.totalErrors.Add(1)
+		http.Error(w, "bad JSON", http.StatusBadRequest)
+		return
+	}
+	if len(req.Features) != numFeatures {
+		s.totalErrors.Add(1)
+		http.Error(w, fmt.Sprintf("expected %d features, got %d", numFeatures, len(req.Features)),
+			http.StatusBadRequest)
+		return
 	}
 
-	predictedClass := labelTensor.GetData()[0]
-	probaData := probaTensor.GetData() // [P(legit), P(fraud)]
-	fraudProba := probaData[1]
+	start := time.Now()
 
-	fmt.Println("\n" + strRepeat("=", 60))
-	fmt.Println(label)
-	fmt.Println(strRepeat("=", 60))
-	fmt.Printf("Predicted class:    %d\n", predictedClass)
-	fmt.Printf("P(legit):           %.6f\n", probaData[0])
-	fmt.Printf("P(fraud):           %.6f\n", fraudProba)
-	fmt.Printf("Python P(fraud):    %.6f\n", pythonProba)
-	fmt.Printf("Absolute diff:      %.2e\n", absFloat32(fraudProba-pythonProba))
+	// Critical section: tensors aren't thread-safe. One prediction at a time.
+	s.mu.Lock()
+	copy(s.input.GetData(), req.Features)
+	if err := s.session.Run(); err != nil {
+		s.mu.Unlock()
+		s.totalErrors.Add(1)
+		log.Printf("inference error: %v", err)
+		http.Error(w, "inference failed", http.StatusInternalServerError)
+		return
+	}
+	predictedClass := s.label.GetData()[0]
+	fraudProba := s.proba.GetData()[1]
+	s.mu.Unlock()
 
-	if absFloat32(fraudProba-pythonProba) < 1e-4 {
-		fmt.Println("✓ MATCHES Python within tolerance")
+	latencyMicros := time.Since(start).Microseconds()
+
+	// Apply the business-cost-optimal threshold from Day 2.
+	decision := "allow"
+	if float64(fraudProba) >= s.threshold {
+		decision = "block"
+		s.totalBlock.Add(1)
 	} else {
-		fmt.Println("✗ DIVERGES from Python — investigate")
+		s.totalAllow.Add(1)
+	}
+	s.totalRequests.Add(1)
+
+	resp := PredictResponse{
+		FraudProbability: fraudProba,
+		PredictedClass:   predictedClass,
+		Decision:         decision,
+		ThresholdUsed:    s.threshold,
+		LatencyMicros:    latencyMicros,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("response encode error: %v", err)
 	}
 }
 
-func absFloat32(x float32) float32 {
-	if x < 0 {
-		return -x
-	}
-	return x
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("ok"))
 }
 
-func strRepeat(s string, n int) string {
-	out := ""
-	for i := 0; i < n; i++ {
-		out += s
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	uptime := time.Since(s.startedAt).Seconds()
+	total := s.totalRequests.Load()
+	rps := 0.0
+	if uptime > 0 {
+		rps = float64(total) / uptime
 	}
-	return out
+	out := map[string]interface{}{
+		"total_requests":  total,
+		"allow":           s.totalAllow.Load(),
+		"block":           s.totalBlock.Load(),
+		"errors":          s.totalErrors.Load(),
+		"uptime_seconds":  uptime,
+		"avg_rps":         rps,
+		"threshold":       s.threshold,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }
