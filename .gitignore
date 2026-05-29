@@ -15,3 +15,4 @@ data/*.zip
 
 # OS
 .DS_Store
+models/
