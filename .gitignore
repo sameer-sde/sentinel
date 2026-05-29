@@ -1,0 +1,17 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Data files (too big for git, can be downloaded)
+data/*.csv
+data/*.zip
+
+# Model artifacts (we'll generate these later)
+*.onnx
+*.bin
+*.pkl
+
+# OS
+.DS_Store
