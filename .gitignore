@@ -13,6 +13,13 @@ data/*.zip
 *.bin
 *.pkl
 
+# Go build artifacts
+/cmd/server/server
+*.exe
+
+# ONNX Runtime native library (re-downloaded per environment)
+/onnxruntime/
+
 # OS
 .DS_Store
 models/
