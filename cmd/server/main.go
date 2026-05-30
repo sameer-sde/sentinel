@@ -1,10 +1,7 @@
 // Sentinel — fraud detection serving layer.
 //
 // Day 9: monitoring + drift detection.
-// - Drift tracker computes per-feature running mean/stddev (Welford's algo)
-// - Baseline locked after first N requests
-// - /admin/drift reports current vs baseline z-scores
-// - /metrics/prom exposes Prometheus-format text
+// Day 10: CORS middleware so the React dashboard can hit the API.
 package main
 
 import (
@@ -43,9 +40,8 @@ const (
 	cacheCapacity = 10000
 	cacheTTL      = 2 * time.Second
 
-	// Drift detection
-	baselineSampleSize = 500 // capture baseline from first N requests
-	driftZThreshold    = 3.0 // |z| > 3.0 = drift
+	baselineSampleSize = 500
+	driftZThreshold    = 3.0
 )
 
 // -------------------- types --------------------
@@ -100,12 +96,10 @@ type modelBundle struct {
 
 // -------------------- drift tracker --------------------
 
-// featureStats holds running mean and variance using Welford's online algorithm.
-// O(1) update per sample, numerically stable.
 type featureStats struct {
 	count uint64
 	mean  float64
-	m2    float64 // sum of squared deviations from mean
+	m2    float64
 }
 
 func (fs *featureStats) Add(x float64) {
@@ -127,12 +121,11 @@ func (fs *featureStats) StdDev() float64 {
 	return math.Sqrt(fs.Variance())
 }
 
-// DriftTracker holds baseline (locked after baselineSampleSize) and current stats.
 type DriftTracker struct {
-	mu       sync.Mutex
-	baseline [numFeatures]featureStats
-	current  [numFeatures]featureStats
-	totalObserved uint64
+	mu             sync.Mutex
+	baseline       [numFeatures]featureStats
+	current        [numFeatures]featureStats
+	totalObserved  uint64
 	baselineLocked bool
 }
 
@@ -140,15 +133,10 @@ func NewDriftTracker() *DriftTracker {
 	return &DriftTracker{}
 }
 
-// Observe records one sample (a feature vector).
-// During the baseline phase, samples accumulate into baseline.
-// After lock, samples accumulate into current — current can be reset for a sliding window.
 func (d *DriftTracker) Observe(features []float32) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
 	d.totalObserved++
-
 	if !d.baselineLocked {
 		for i := 0; i < numFeatures; i++ {
 			d.baseline[i].Add(float64(features[i]))
@@ -159,13 +147,11 @@ func (d *DriftTracker) Observe(features []float32) {
 		}
 		return
 	}
-
 	for i := 0; i < numFeatures; i++ {
 		d.current[i].Add(float64(features[i]))
 	}
 }
 
-// ResetCurrent clears the current window (call periodically for sliding window).
 func (d *DriftTracker) ResetCurrent() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -195,7 +181,6 @@ type driftSummary struct {
 func (d *DriftTracker) Report() driftSummary {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
 	var summary driftSummary
 	summary.BaselineLocked = d.baselineLocked
 	if d.baselineLocked {
@@ -204,21 +189,16 @@ func (d *DriftTracker) Report() driftSummary {
 		summary.BaselineCount = d.totalObserved
 	}
 	summary.CurrentCount = d.current[0].count
-
 	for i := 0; i < numFeatures; i++ {
 		bs := d.baseline[i]
 		cs := d.current[i]
-
 		report := driftReport{
 			FeatureIndex: i,
 			BaselineMean: bs.mean,
 			BaselineStd:  bs.StdDev(),
 			CurrentMean:  cs.mean,
 		}
-
-		// z-score only meaningful when baseline is locked AND we have current samples
 		if d.baselineLocked && cs.count >= 30 && bs.StdDev() > 0 {
-			// z = (current_mean - baseline_mean) / (baseline_std / sqrt(N))
 			se := bs.StdDev() / math.Sqrt(float64(cs.count))
 			report.ZScore = (cs.mean - bs.mean) / se
 			if math.Abs(report.ZScore) > driftZThreshold {
@@ -227,13 +207,12 @@ func (d *DriftTracker) Report() driftSummary {
 				summary.DriftedFeatures = append(summary.DriftedFeatures, i)
 			}
 		}
-
 		summary.PerFeature = append(summary.PerFeature, report)
 	}
 	return summary
 }
 
-// -------------------- LRU cache (unchanged) --------------------
+// -------------------- LRU cache --------------------
 
 type cacheEntry struct {
 	key       uint64
@@ -330,22 +309,19 @@ func hashFeatures(features []float32) uint64 {
 
 // -------------------- latency histogram --------------------
 
-// LatencyHistogram bins observed latencies into a few buckets.
-// Used for the Prometheus exposition.
 type LatencyHistogram struct {
 	mu      sync.Mutex
-	buckets []int64 // counts per bucket
-	bounds  []int64 // upper bounds (microseconds); last is +Inf implicit
+	buckets []int64
+	bounds  []int64
 	count   int64
 	sum     int64
 }
 
 func NewLatencyHistogram() *LatencyHistogram {
-	// Buckets in microseconds: 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000
 	bounds := []int64{50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000}
 	return &LatencyHistogram{
 		bounds:  bounds,
-		buckets: make([]int64, len(bounds)+1), // +1 for +Inf
+		buckets: make([]int64, len(bounds)+1),
 	}
 }
 
@@ -360,7 +336,6 @@ func (h *LatencyHistogram) Observe(latencyMicros int64) {
 	h.buckets[idx]++
 }
 
-// Snapshot returns a copy for export.
 func (h *LatencyHistogram) Snapshot() ([]int64, []int64, int64, int64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -369,7 +344,7 @@ func (h *LatencyHistogram) Snapshot() ([]int64, []int64, int64, int64) {
 	return h.bounds, b, h.count, h.sum
 }
 
-// -------------------- model loader (unchanged) --------------------
+// -------------------- model loader --------------------
 
 func loadBundleFromPath(dirPath, version string) (*modelBundle, error) {
 	path := filepath.Join(dirPath, modelFile)
@@ -433,10 +408,10 @@ func (m *modelBundle) Destroy() {
 // -------------------- server --------------------
 
 type Server struct {
-	jobs      chan inferenceJob
-	threshold float64
-	cache     *LRUCache
-	drift     *DriftTracker
+	jobs        chan inferenceJob
+	threshold   float64
+	cache       *LRUCache
+	drift       *DriftTracker
 	latencyHist *LatencyHistogram
 
 	bundleA      atomic.Pointer[modelBundle]
@@ -510,12 +485,11 @@ func main() {
 	mux.HandleFunc("/admin/ab/status", s.handleABStatus)
 
 	log.Printf("✓ Listening on http://localhost%s", httpAddr)
-	if err := http.ListenAndServe(httpAddr, mux); err != nil {
+	if err := http.ListenAndServe(httpAddr, withCORS(mux)); err != nil {
 		log.Fatalf("server: %v", err)
 	}
 }
 
-// driftMonitor: every 30s, log a summary of drift status.
 func (s *Server) driftMonitor() {
 	tick := time.NewTicker(30 * time.Second)
 	defer tick.Stop()
@@ -527,7 +501,7 @@ func (s *Server) driftMonitor() {
 	}
 }
 
-// -------------------- batcher (same as Day 8) --------------------
+// -------------------- batcher --------------------
 
 func (s *Server) batcher() {
 	defer func() {
@@ -647,7 +621,6 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Feed drift tracker.
 	s.drift.Observe(req.Features)
 
 	start := time.Now()
@@ -980,7 +953,6 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(out)
 }
 
-// handlePromMetrics: Prometheus text exposition format.
 func (s *Server) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	fmt.Fprintln(w, "# HELP sentinel_requests_total Total prediction requests")
@@ -1006,7 +978,6 @@ func (s *Server) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "sentinel_variant_predictions_total{variant=\"A\"} %d\n", s.predictionsA.Load())
 	fmt.Fprintf(w, "sentinel_variant_predictions_total{variant=\"B\"} %d\n", s.predictionsB.Load())
 
-	// Latency histogram in Prometheus format.
 	bounds, buckets, count, sum := s.latencyHist.Snapshot()
 	fmt.Fprintln(w, "# HELP sentinel_latency_microseconds Predict latency in µs")
 	fmt.Fprintln(w, "# TYPE sentinel_latency_microseconds histogram")
@@ -1020,7 +991,6 @@ func (s *Server) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "sentinel_latency_microseconds_count %d\n", count)
 	fmt.Fprintf(w, "sentinel_latency_microseconds_sum %d\n", sum)
 
-	// Drift flag as a gauge.
 	driftFlag := 0
 	driftSum := s.drift.Report()
 	if driftSum.DriftDetected {
@@ -1041,4 +1011,19 @@ func loadThresholdConfig(path string) (*ThresholdConfig, error) {
 		return nil, fmt.Errorf("parse: %w", err)
 	}
 	return &cfg, nil
+}
+
+// withCORS wraps a handler to add CORS headers so the React dashboard
+// at a different origin can hit the API.
+func withCORS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
