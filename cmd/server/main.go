@@ -1,8 +1,10 @@
 // Sentinel — fraud detection serving layer.
 //
-// Day 6: LRU prediction cache + TTL on top of Day 5's request batching.
-// Cache key = FNV-1a hash of the 30 feature floats. Cache hits skip the
-// batcher entirely — microsecond response vs milliseconds for the model.
+// Day 7: model versioning + hot-swap.
+// - Models live in models/<version>/fraud_model.onnx
+// - models/current symlink points to active version
+// - /admin/reload re-reads models/current and atomically swaps the session
+// - In-flight requests finish with old model; new requests use new model
 package main
 
 import (
@@ -15,6 +17,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,17 +27,16 @@ import (
 
 const (
 	onnxRuntimeLib   = "../../onnxruntime/libonnxruntime.dylib"
-	modelPath        = "../../models/fraud_model.onnx"
+	modelDir         = "../../models/current"
+	modelFile        = "fraud_model.onnx"
 	thresholdCfgPath = "../../models/threshold_config.json"
 	numFeatures      = 30
 	httpAddr         = ":8080"
 
-	// Batching.
 	maxBatch     = 32
 	maxWait      = 5 * time.Millisecond
 	jobQueueSize = 256
 
-	// Cache.
 	cacheCapacity = 10000
 	cacheTTL      = 2 * time.Second
 )
@@ -61,6 +63,7 @@ type PredictResponse struct {
 	LatencyMicros    int64   `json:"latency_us"`
 	BatchSize        int     `json:"batch_size"`
 	CacheHit         bool    `json:"cache_hit"`
+	ModelVersion     string  `json:"model_version"`
 }
 
 type inferenceJob struct {
@@ -69,13 +72,26 @@ type inferenceJob struct {
 }
 
 type inferenceResult struct {
-	fraudProba float32
-	class      int64
-	batchSize  int
-	err        error
+	fraudProba   float32
+	class        int64
+	batchSize    int
+	modelVersion string
+	err          error
 }
 
-// -------------------- LRU cache --------------------
+// modelBundle holds a session and its associated tensors.
+// We store *this struct atomically and replace it wholesale on reload —
+// can't swap the session without also swapping its bound tensors.
+type modelBundle struct {
+	session *ort.AdvancedSession
+	input   *ort.Tensor[float32]
+	label   *ort.Tensor[int64]
+	proba   *ort.Tensor[float32]
+	version string // resolved symlink target, e.g. "v1"
+	path    string // absolute path the session was loaded from
+}
+
+// -------------------- LRU cache (unchanged from Day 6) --------------------
 
 type cacheEntry struct {
 	key       uint64
@@ -84,14 +100,12 @@ type cacheEntry struct {
 	expiresAt time.Time
 }
 
-// LRUCache: map + doubly-linked list. O(1) get/put.
-// Mutex-protected because /predict handlers run concurrently.
 type LRUCache struct {
 	mu       sync.Mutex
 	capacity int
 	ttl      time.Duration
 	items    map[uint64]*list.Element
-	order    *list.List // front = MRU, back = LRU
+	order    *list.List
 }
 
 func NewLRUCache(capacity int, ttl time.Duration) *LRUCache {
@@ -113,7 +127,6 @@ func (c *LRUCache) Get(key uint64) (*cacheEntry, bool) {
 	}
 	entry := elem.Value.(*cacheEntry)
 	if time.Now().After(entry.expiresAt) {
-		// expired — evict
 		c.order.Remove(elem)
 		delete(c.items, key)
 		return nil, false
@@ -144,7 +157,6 @@ func (c *LRUCache) Put(key uint64, proba float32, class int64) {
 	elem := c.order.PushFront(entry)
 	c.items[key] = elem
 
-	// evict LRU if over capacity
 	if c.order.Len() > c.capacity {
 		oldest := c.order.Back()
 		if oldest != nil {
@@ -155,15 +167,19 @@ func (c *LRUCache) Put(key uint64, proba float32, class int64) {
 	}
 }
 
+func (c *LRUCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items = make(map[uint64]*list.Element, c.capacity)
+	c.order = list.New()
+}
+
 func (c *LRUCache) Size() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.order.Len()
 }
 
-// hashFeatures: FNV-1a over the IEEE-754 bytes of the 30 floats.
-// Fast, non-cryptographic, deterministic — identical floats produce
-// identical bytes produce identical hash.
 func hashFeatures(features []float32) uint64 {
 	h := fnv.New64a()
 	buf := make([]byte, 4)
@@ -174,12 +190,81 @@ func hashFeatures(features []float32) uint64 {
 	return h.Sum64()
 }
 
+// -------------------- model loader --------------------
+
+// loadModelBundle creates a new session + tensors from the file at modelDir/modelFile.
+// Returns the resolved version (the symlink target) so we can report it.
+func loadModelBundle() (*modelBundle, error) {
+	// Resolve the symlink to find the real version directory.
+	resolved, err := filepath.EvalSymlinks(modelDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve symlink %s: %w", modelDir, err)
+	}
+	version := filepath.Base(resolved)
+	path := filepath.Join(modelDir, modelFile)
+
+	input, err := ort.NewEmptyTensor[float32](ort.NewShape(maxBatch, numFeatures))
+	if err != nil {
+		return nil, fmt.Errorf("create input tensor: %w", err)
+	}
+	label, err := ort.NewEmptyTensor[int64](ort.NewShape(maxBatch))
+	if err != nil {
+		input.Destroy()
+		return nil, fmt.Errorf("create label tensor: %w", err)
+	}
+	proba, err := ort.NewEmptyTensor[float32](ort.NewShape(maxBatch, 2))
+	if err != nil {
+		input.Destroy()
+		label.Destroy()
+		return nil, fmt.Errorf("create proba tensor: %w", err)
+	}
+
+	session, err := ort.NewAdvancedSession(
+		path,
+		[]string{"input"},
+		[]string{"label", "probabilities"},
+		[]ort.ArbitraryTensor{input},
+		[]ort.ArbitraryTensor{label, proba},
+		nil,
+	)
+	if err != nil {
+		input.Destroy()
+		label.Destroy()
+		proba.Destroy()
+		return nil, fmt.Errorf("create session from %s: %w", path, err)
+	}
+
+	return &modelBundle{
+		session: session,
+		input:   input,
+		label:   label,
+		proba:   proba,
+		version: version,
+		path:    path,
+	}, nil
+}
+
+func (m *modelBundle) Destroy() {
+	if m == nil {
+		return
+	}
+	m.session.Destroy()
+	m.input.Destroy()
+	m.label.Destroy()
+	m.proba.Destroy()
+}
+
 // -------------------- server --------------------
 
 type Server struct {
 	jobs      chan inferenceJob
 	threshold float64
 	cache     *LRUCache
+
+	// Atomic pointer to the live model bundle. Batcher reads, /admin/reload writes.
+	bundle atomic.Pointer[modelBundle]
+	// reloadMu serializes reload operations (only one swap at a time).
+	reloadMu sync.Mutex
 
 	totalRequests atomic.Uint64
 	totalAllow    atomic.Uint64
@@ -188,6 +273,7 @@ type Server struct {
 	batchCount    atomic.Uint64
 	cacheHits     atomic.Uint64
 	cacheMisses   atomic.Uint64
+	reloadCount   atomic.Uint64
 	startedAt     time.Time
 }
 
@@ -205,12 +291,19 @@ func main() {
 	defer ort.DestroyEnvironment()
 	log.Println("✓ ONNX Runtime initialized")
 
+	bundle, err := loadModelBundle()
+	if err != nil {
+		log.Fatalf("initial model load: %v", err)
+	}
+	log.Printf("✓ Loaded model version %s from %s", bundle.version, bundle.path)
+
 	s := &Server{
 		jobs:      make(chan inferenceJob, jobQueueSize),
 		threshold: cfg.OptimalThreshold,
 		cache:     NewLRUCache(cacheCapacity, cacheTTL),
 		startedAt: time.Now(),
 	}
+	s.bundle.Store(bundle)
 	log.Printf("✓ LRU cache ready: capacity=%d TTL=%v", cacheCapacity, cacheTTL)
 
 	go s.batcher()
@@ -219,6 +312,8 @@ func main() {
 	mux.HandleFunc("/predict", s.handlePredict)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/admin/version", s.handleVersion)
+	mux.HandleFunc("/admin/reload", s.handleReload)
 
 	log.Printf("✓ Listening on http://localhost%s (maxBatch=%d maxWait=%v)",
 		httpAddr, maxBatch, maxWait)
@@ -236,41 +331,9 @@ func (s *Server) batcher() {
 		}
 	}()
 
-	inputTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(maxBatch, numFeatures))
-	if err != nil {
-		log.Fatalf("batcher: create input tensor: %v", err)
-	}
-	defer inputTensor.Destroy()
-
-	labelTensor, err := ort.NewEmptyTensor[int64](ort.NewShape(maxBatch))
-	if err != nil {
-		log.Fatalf("batcher: create label tensor: %v", err)
-	}
-	defer labelTensor.Destroy()
-
-	probaTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(maxBatch, 2))
-	if err != nil {
-		log.Fatalf("batcher: create proba tensor: %v", err)
-	}
-	defer probaTensor.Destroy()
-
-	session, err := ort.NewAdvancedSession(
-		modelPath,
-		[]string{"input"},
-		[]string{"label", "probabilities"},
-		[]ort.ArbitraryTensor{inputTensor},
-		[]ort.ArbitraryTensor{labelTensor, probaTensor},
-		nil,
-	)
-	if err != nil {
-		log.Fatalf("batcher: create session: %v", err)
-	}
-	defer session.Destroy()
-
-	log.Println("✓ Batcher goroutine ready, ONNX session bound")
+	log.Println("✓ Batcher goroutine ready")
 
 	batch := make([]inferenceJob, 0, maxBatch)
-	inputData := inputTensor.GetData()
 
 	for {
 		first, ok := <-s.jobs
@@ -295,6 +358,11 @@ func (s *Server) batcher() {
 			}
 		}
 
+		// Read the live bundle for this batch.
+		// If /admin/reload swaps mid-batch, the next batch picks up the new one.
+		bundle := s.bundle.Load()
+		inputData := bundle.input.GetData()
+
 		for i, j := range batch {
 			copy(inputData[i*numFeatures:(i+1)*numFeatures], j.features)
 		}
@@ -304,7 +372,7 @@ func (s *Server) batcher() {
 			}
 		}
 
-		if err := session.Run(); err != nil {
+		if err := bundle.session.Run(); err != nil {
 			result := inferenceResult{err: err}
 			for _, j := range batch {
 				j.reply <- result
@@ -313,14 +381,15 @@ func (s *Server) batcher() {
 			continue
 		}
 
-		labels := labelTensor.GetData()
-		probas := probaTensor.GetData()
+		labels := bundle.label.GetData()
+		probas := bundle.proba.GetData()
 		batchSize := len(batch)
 		for i, j := range batch {
 			j.reply <- inferenceResult{
-				fraudProba: probas[i*2+1],
-				class:      labels[i],
-				batchSize:  batchSize,
+				fraudProba:   probas[i*2+1],
+				class:        labels[i],
+				batchSize:    batchSize,
+				modelVersion: bundle.version,
 			}
 		}
 		s.batchCount.Add(1)
@@ -355,16 +424,16 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 	var predictedClass int64
 	var batchSize int
 	var cacheHit bool
+	var modelVersion string
 
-	// 1. Cache lookup.
 	if entry, ok := s.cache.Get(key); ok {
 		fraudProba = entry.proba
 		predictedClass = entry.class
 		cacheHit = true
 		batchSize = 0
+		modelVersion = s.bundle.Load().version
 		s.cacheHits.Add(1)
 	} else {
-		// 2. Cache miss — go through batcher.
 		s.cacheMisses.Add(1)
 		reply := make(chan inferenceResult, 1)
 		s.jobs <- inferenceJob{features: req.Features, reply: reply}
@@ -378,7 +447,7 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 		fraudProba = result.fraudProba
 		predictedClass = result.class
 		batchSize = result.batchSize
-		// Populate cache.
+		modelVersion = result.modelVersion
 		s.cache.Put(key, fraudProba, predictedClass)
 	}
 
@@ -401,6 +470,7 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 		LatencyMicros:    latencyMicros,
 		BatchSize:        batchSize,
 		CacheHit:         cacheHit,
+		ModelVersion:     modelVersion,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -409,6 +479,63 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
+}
+
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	b := s.bundle.Load()
+	out := map[string]interface{}{
+		"version":      b.version,
+		"path":         b.path,
+		"reload_count": s.reloadCount.Load(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+// handleReload: POST /admin/reload — load the model file at models/current
+// (whatever the symlink now resolves to) and atomically swap the live bundle.
+// Cache is invalidated since new model may produce different predictions.
+func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Serialize concurrent reloads.
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
+	oldBundle := s.bundle.Load()
+	log.Printf("Reload requested. Current version: %s", oldBundle.version)
+
+	newBundle, err := loadModelBundle()
+	if err != nil {
+		log.Printf("Reload failed: %v", err)
+		http.Error(w, fmt.Sprintf("reload failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Atomic swap. Batches in-flight finish on oldBundle.
+	s.bundle.Store(newBundle)
+	s.cache.Clear()
+	s.reloadCount.Add(1)
+
+	log.Printf("✓ Swapped %s → %s", oldBundle.version, newBundle.version)
+
+	// Give in-flight batches ~50ms to finish before destroying old bundle.
+	// Crude but safe for our throughput. Real systems use refcounting.
+	go func(old *modelBundle) {
+		time.Sleep(50 * time.Millisecond)
+		old.Destroy()
+	}(oldBundle)
+
+	out := map[string]interface{}{
+		"status":      "ok",
+		"old_version": oldBundle.version,
+		"new_version": newBundle.version,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -444,6 +571,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"cache_size":     s.cache.Size(),
 		"cache_capacity": cacheCapacity,
 		"cache_ttl_ms":   cacheTTL.Milliseconds(),
+		"reload_count":   s.reloadCount.Load(),
+		"model_version":  s.bundle.Load().version,
 		"uptime_seconds": uptime,
 		"avg_rps":        rps,
 		"threshold":      s.threshold,
@@ -453,8 +582,6 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
 }
-
-// -------------------- helpers --------------------
 
 func loadThresholdConfig(path string) (*ThresholdConfig, error) {
 	data, err := os.ReadFile(path)
