@@ -1,10 +1,18 @@
 // Sentinel — fraud detection serving layer.
 //
-// Day 7: model versioning + hot-swap.
-// - Models live in models/<version>/fraud_model.onnx
-// - models/current symlink points to active version
-// - /admin/reload re-reads models/current and atomically swaps the session
-// - In-flight requests finish with old model; new requests use new model
+// Day 8: A/B traffic split between two model versions.
+// - bundleA = production model (always present)
+// - bundleB = candidate model (optional)
+// - splitPercent = % of traffic routed to B
+//
+// /admin/ab/setup    — load a candidate as B
+// /admin/ab/split    — set split percentage
+// /admin/ab/promote  — promote B to A, clear B
+// /admin/ab/abort    — set split to 0, destroy B
+// /admin/ab/status   — current state + per-variant traffic
+//
+// Cache is bypassed when B is loaded — otherwise we'd defeat the A/B test
+// by returning cached v1 predictions for traffic routed to v2.
 package main
 
 import (
@@ -15,6 +23,7 @@ import (
 	"hash/fnv"
 	"log"
 	"math"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,6 +36,7 @@ import (
 
 const (
 	onnxRuntimeLib   = "../../onnxruntime/libonnxruntime.dylib"
+	modelsRoot       = "../../models"
 	modelDir         = "../../models/current"
 	modelFile        = "fraud_model.onnx"
 	thresholdCfgPath = "../../models/threshold_config.json"
@@ -64,10 +74,12 @@ type PredictResponse struct {
 	BatchSize        int     `json:"batch_size"`
 	CacheHit         bool    `json:"cache_hit"`
 	ModelVersion     string  `json:"model_version"`
+	Variant          string  `json:"variant"` // "A" or "B"
 }
 
 type inferenceJob struct {
 	features []float32
+	bundle   *modelBundle // which model to use for THIS request
 	reply    chan inferenceResult
 }
 
@@ -79,19 +91,20 @@ type inferenceResult struct {
 	err          error
 }
 
-// modelBundle holds a session and its associated tensors.
-// We store *this struct atomically and replace it wholesale on reload —
-// can't swap the session without also swapping its bound tensors.
 type modelBundle struct {
 	session *ort.AdvancedSession
 	input   *ort.Tensor[float32]
 	label   *ort.Tensor[int64]
 	proba   *ort.Tensor[float32]
-	version string // resolved symlink target, e.g. "v1"
-	path    string // absolute path the session was loaded from
+	version string
+	path    string
+
+	// Per-bundle mutex so we don't run two batches on the same session at once.
+	// (Different bundles run in parallel — that's the win.)
+	mu sync.Mutex
 }
 
-// -------------------- LRU cache (unchanged from Day 6) --------------------
+// -------------------- LRU cache --------------------
 
 type cacheEntry struct {
 	key       uint64
@@ -192,16 +205,10 @@ func hashFeatures(features []float32) uint64 {
 
 // -------------------- model loader --------------------
 
-// loadModelBundle creates a new session + tensors from the file at modelDir/modelFile.
-// Returns the resolved version (the symlink target) so we can report it.
-func loadModelBundle() (*modelBundle, error) {
-	// Resolve the symlink to find the real version directory.
-	resolved, err := filepath.EvalSymlinks(modelDir)
-	if err != nil {
-		return nil, fmt.Errorf("resolve symlink %s: %w", modelDir, err)
-	}
-	version := filepath.Base(resolved)
-	path := filepath.Join(modelDir, modelFile)
+// loadBundleFromPath loads a model from a specific directory path.
+// version is the directory name (e.g. "v1", "v2") used for reporting.
+func loadBundleFromPath(dirPath, version string) (*modelBundle, error) {
+	path := filepath.Join(dirPath, modelFile)
 
 	input, err := ort.NewEmptyTensor[float32](ort.NewShape(maxBatch, numFeatures))
 	if err != nil {
@@ -244,6 +251,15 @@ func loadModelBundle() (*modelBundle, error) {
 	}, nil
 }
 
+// loadCurrentBundle resolves the current symlink and loads that model.
+func loadCurrentBundle() (*modelBundle, error) {
+	resolved, err := filepath.EvalSymlinks(modelDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve symlink %s: %w", modelDir, err)
+	}
+	return loadBundleFromPath(modelDir, filepath.Base(resolved))
+}
+
 func (m *modelBundle) Destroy() {
 	if m == nil {
 		return
@@ -261,11 +277,13 @@ type Server struct {
 	threshold float64
 	cache     *LRUCache
 
-	// Atomic pointer to the live model bundle. Batcher reads, /admin/reload writes.
-	bundle atomic.Pointer[modelBundle]
-	// reloadMu serializes reload operations (only one swap at a time).
-	reloadMu sync.Mutex
+	// A/B state
+	bundleA      atomic.Pointer[modelBundle]
+	bundleB      atomic.Pointer[modelBundle]
+	splitPercent atomic.Int32 // 0-100; percentage routed to B
+	abMu         sync.Mutex   // serializes admin ops (setup/promote/abort)
 
+	// Counters
 	totalRequests atomic.Uint64
 	totalAllow    atomic.Uint64
 	totalBlock    atomic.Uint64
@@ -273,8 +291,13 @@ type Server struct {
 	batchCount    atomic.Uint64
 	cacheHits     atomic.Uint64
 	cacheMisses   atomic.Uint64
-	reloadCount   atomic.Uint64
-	startedAt     time.Time
+
+	predictionsA atomic.Uint64
+	predictionsB atomic.Uint64
+	blocksA      atomic.Uint64
+	blocksB      atomic.Uint64
+
+	startedAt time.Time
 }
 
 func main() {
@@ -291,11 +314,11 @@ func main() {
 	defer ort.DestroyEnvironment()
 	log.Println("✓ ONNX Runtime initialized")
 
-	bundle, err := loadModelBundle()
+	bundle, err := loadCurrentBundle()
 	if err != nil {
 		log.Fatalf("initial model load: %v", err)
 	}
-	log.Printf("✓ Loaded model version %s from %s", bundle.version, bundle.path)
+	log.Printf("✓ Loaded model A=%s from %s", bundle.version, bundle.path)
 
 	s := &Server{
 		jobs:      make(chan inferenceJob, jobQueueSize),
@@ -303,7 +326,7 @@ func main() {
 		cache:     NewLRUCache(cacheCapacity, cacheTTL),
 		startedAt: time.Now(),
 	}
-	s.bundle.Store(bundle)
+	s.bundleA.Store(bundle)
 	log.Printf("✓ LRU cache ready: capacity=%d TTL=%v", cacheCapacity, cacheTTL)
 
 	go s.batcher()
@@ -314,6 +337,11 @@ func main() {
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/admin/version", s.handleVersion)
 	mux.HandleFunc("/admin/reload", s.handleReload)
+	mux.HandleFunc("/admin/ab/setup", s.handleABSetup)
+	mux.HandleFunc("/admin/ab/split", s.handleABSplit)
+	mux.HandleFunc("/admin/ab/promote", s.handleABPromote)
+	mux.HandleFunc("/admin/ab/abort", s.handleABAbort)
+	mux.HandleFunc("/admin/ab/status", s.handleABStatus)
 
 	log.Printf("✓ Listening on http://localhost%s (maxBatch=%d maxWait=%v)",
 		httpAddr, maxBatch, maxWait)
@@ -324,6 +352,8 @@ func main() {
 
 // -------------------- batcher --------------------
 
+// batcher groups jobs by bundle. Different bundles get separate batches
+// (we can't mix v1 and v2 inputs into one session.Run call).
 func (s *Server) batcher() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -333,15 +363,21 @@ func (s *Server) batcher() {
 
 	log.Println("✓ Batcher goroutine ready")
 
-	batch := make([]inferenceJob, 0, maxBatch)
-
 	for {
 		first, ok := <-s.jobs
 		if !ok {
 			return
 		}
-		batch = batch[:0]
-		batch = append(batch, first)
+
+		// Collect jobs only for the same bundle as `first`.
+		// Jobs for other bundles get held over to next iteration via local buffer.
+		// Simpler approach: do one batch per iteration with whatever bundle 'first' has,
+		// and skip jobs targeting a different bundle by handling them separately.
+		//
+		// Here we keep it simple: collect up to maxBatch jobs for first.bundle,
+		// and if a different-bundle job shows up we run it as its own micro-batch.
+		batch := []inferenceJob{first}
+		var deferredOtherBundle []inferenceJob
 
 		deadline := time.After(maxWait)
 
@@ -352,48 +388,94 @@ func (s *Server) batcher() {
 				if !ok {
 					break collect
 				}
-				batch = append(batch, j)
+				if j.bundle == first.bundle {
+					batch = append(batch, j)
+				} else {
+					deferredOtherBundle = append(deferredOtherBundle, j)
+				}
 			case <-deadline:
 				break collect
 			}
 		}
 
-		// Read the live bundle for this batch.
-		// If /admin/reload swaps mid-batch, the next batch picks up the new one.
-		bundle := s.bundle.Load()
-		inputData := bundle.input.GetData()
+		s.runBatch(first.bundle, batch)
 
-		for i, j := range batch {
-			copy(inputData[i*numFeatures:(i+1)*numFeatures], j.features)
-		}
-		for i := len(batch); i < maxBatch; i++ {
-			for k := 0; k < numFeatures; k++ {
-				inputData[i*numFeatures+k] = 0
+		// Now process the deferred jobs (different bundle) as their own batches.
+		// They'll likely be a small group, but correctness > optimality.
+		for len(deferredOtherBundle) > 0 {
+			bundle := deferredOtherBundle[0].bundle
+			var same, other []inferenceJob
+			for _, j := range deferredOtherBundle {
+				if j.bundle == bundle {
+					same = append(same, j)
+				} else {
+					other = append(other, j)
+				}
 			}
+			s.runBatch(bundle, same)
+			deferredOtherBundle = other
 		}
-
-		if err := bundle.session.Run(); err != nil {
-			result := inferenceResult{err: err}
-			for _, j := range batch {
-				j.reply <- result
-			}
-			log.Printf("batcher: inference error: %v", err)
-			continue
-		}
-
-		labels := bundle.label.GetData()
-		probas := bundle.proba.GetData()
-		batchSize := len(batch)
-		for i, j := range batch {
-			j.reply <- inferenceResult{
-				fraudProba:   probas[i*2+1],
-				class:        labels[i],
-				batchSize:    batchSize,
-				modelVersion: bundle.version,
-			}
-		}
-		s.batchCount.Add(1)
 	}
+}
+
+// runBatch executes one inference call for jobs sharing the same bundle.
+func (s *Server) runBatch(bundle *modelBundle, jobs []inferenceJob) {
+	if len(jobs) == 0 {
+		return
+	}
+
+	// Lock this bundle so two batcher invocations don't tread on its tensors.
+	bundle.mu.Lock()
+	defer bundle.mu.Unlock()
+
+	inputData := bundle.input.GetData()
+	for i, j := range jobs {
+		copy(inputData[i*numFeatures:(i+1)*numFeatures], j.features)
+	}
+	for i := len(jobs); i < maxBatch; i++ {
+		for k := 0; k < numFeatures; k++ {
+			inputData[i*numFeatures+k] = 0
+		}
+	}
+
+	if err := bundle.session.Run(); err != nil {
+		result := inferenceResult{err: err}
+		for _, j := range jobs {
+			j.reply <- result
+		}
+		log.Printf("batcher: inference error: %v", err)
+		return
+	}
+
+	labels := bundle.label.GetData()
+	probas := bundle.proba.GetData()
+	batchSize := len(jobs)
+	for i, j := range jobs {
+		j.reply <- inferenceResult{
+			fraudProba:   probas[i*2+1],
+			class:        labels[i],
+			batchSize:    batchSize,
+			modelVersion: bundle.version,
+		}
+	}
+	s.batchCount.Add(1)
+}
+
+// -------------------- routing --------------------
+
+// pickBundle returns the bundle for THIS request based on splitPercent.
+// Returns the bundle and the variant label ("A" or "B").
+// If B isn't loaded (nil), always returns A regardless of splitPercent.
+func (s *Server) pickBundle() (*modelBundle, string) {
+	a := s.bundleA.Load()
+	b := s.bundleB.Load()
+	if b == nil {
+		return a, "A"
+	}
+	if rand.Intn(100) < int(s.splitPercent.Load()) {
+		return b, "B"
+	}
+	return a, "A"
 }
 
 // -------------------- HTTP handlers --------------------
@@ -419,24 +501,30 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	key := hashFeatures(req.Features)
+	bundle, variant := s.pickBundle()
+	abActive := s.bundleB.Load() != nil
 
 	var fraudProba float32
 	var predictedClass int64
 	var batchSize int
 	var cacheHit bool
-	var modelVersion string
 
-	if entry, ok := s.cache.Get(key); ok {
-		fraudProba = entry.proba
-		predictedClass = entry.class
-		cacheHit = true
-		batchSize = 0
-		modelVersion = s.bundle.Load().version
-		s.cacheHits.Add(1)
-	} else {
-		s.cacheMisses.Add(1)
+	// Bypass cache when A/B is active (would defeat the test).
+	if !abActive {
+		if entry, ok := s.cache.Get(key); ok {
+			fraudProba = entry.proba
+			predictedClass = entry.class
+			cacheHit = true
+			s.cacheHits.Add(1)
+		}
+	}
+
+	if !cacheHit {
+		if !abActive {
+			s.cacheMisses.Add(1)
+		}
 		reply := make(chan inferenceResult, 1)
-		s.jobs <- inferenceJob{features: req.Features, reply: reply}
+		s.jobs <- inferenceJob{features: req.Features, bundle: bundle, reply: reply}
 		result := <-reply
 		if result.err != nil {
 			s.totalErrors.Add(1)
@@ -447,8 +535,10 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 		fraudProba = result.fraudProba
 		predictedClass = result.class
 		batchSize = result.batchSize
-		modelVersion = result.modelVersion
-		s.cache.Put(key, fraudProba, predictedClass)
+		// Only cache when A/B is not active.
+		if !abActive {
+			s.cache.Put(key, fraudProba, predictedClass)
+		}
 	}
 
 	latencyMicros := time.Since(start).Microseconds()
@@ -457,10 +547,20 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 	if float64(fraudProba) >= s.threshold {
 		decision = "block"
 		s.totalBlock.Add(1)
+		if variant == "B" {
+			s.blocksB.Add(1)
+		} else {
+			s.blocksA.Add(1)
+		}
 	} else {
 		s.totalAllow.Add(1)
 	}
 	s.totalRequests.Add(1)
+	if variant == "B" {
+		s.predictionsB.Add(1)
+	} else {
+		s.predictionsA.Add(1)
+	}
 
 	resp := PredictResponse{
 		FraudProbability: fraudProba,
@@ -470,7 +570,8 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 		LatencyMicros:    latencyMicros,
 		BatchSize:        batchSize,
 		CacheHit:         cacheHit,
-		ModelVersion:     modelVersion,
+		ModelVersion:     bundle.version,
+		Variant:          variant,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -482,57 +583,229 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
-	b := s.bundle.Load()
+	a := s.bundleA.Load()
 	out := map[string]interface{}{
-		"version":      b.version,
-		"path":         b.path,
-		"reload_count": s.reloadCount.Load(),
+		"version_a": a.version,
+		"path_a":    a.path,
+	}
+	if b := s.bundleB.Load(); b != nil {
+		out["version_b"] = b.version
+		out["path_b"] = b.path
+		out["split_percent"] = s.splitPercent.Load()
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
 }
 
-// handleReload: POST /admin/reload — load the model file at models/current
-// (whatever the symlink now resolves to) and atomically swap the live bundle.
-// Cache is invalidated since new model may produce different predictions.
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
+	s.abMu.Lock()
+	defer s.abMu.Unlock()
 
-	// Serialize concurrent reloads.
-	s.reloadMu.Lock()
-	defer s.reloadMu.Unlock()
+	if s.bundleB.Load() != nil {
+		http.Error(w, "A/B test active — abort or promote first", http.StatusConflict)
+		return
+	}
 
-	oldBundle := s.bundle.Load()
-	log.Printf("Reload requested. Current version: %s", oldBundle.version)
-
-	newBundle, err := loadModelBundle()
+	oldBundle := s.bundleA.Load()
+	newBundle, err := loadCurrentBundle()
 	if err != nil {
 		log.Printf("Reload failed: %v", err)
 		http.Error(w, fmt.Sprintf("reload failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Atomic swap. Batches in-flight finish on oldBundle.
-	s.bundle.Store(newBundle)
+	s.bundleA.Store(newBundle)
 	s.cache.Clear()
-	s.reloadCount.Add(1)
+	log.Printf("✓ Reload: A %s → %s", oldBundle.version, newBundle.version)
 
-	log.Printf("✓ Swapped %s → %s", oldBundle.version, newBundle.version)
-
-	// Give in-flight batches ~50ms to finish before destroying old bundle.
-	// Crude but safe for our throughput. Real systems use refcounting.
 	go func(old *modelBundle) {
 		time.Sleep(50 * time.Millisecond)
 		old.Destroy()
 	}(oldBundle)
 
+	out := map[string]string{"status": "ok", "old_version": oldBundle.version, "new_version": newBundle.version}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+// -------------------- A/B admin handlers --------------------
+
+type abSetupReq struct {
+	CandidateVersion string `json:"candidate_version"` // e.g. "v2"
+}
+
+func (s *Server) handleABSetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req abSetupReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON", http.StatusBadRequest)
+		return
+	}
+	if req.CandidateVersion == "" {
+		http.Error(w, "candidate_version required", http.StatusBadRequest)
+		return
+	}
+
+	s.abMu.Lock()
+	defer s.abMu.Unlock()
+
+	if s.bundleB.Load() != nil {
+		http.Error(w, "candidate already loaded — abort first", http.StatusConflict)
+		return
+	}
+
+	candidatePath := filepath.Join(modelsRoot, req.CandidateVersion)
+	if _, err := os.Stat(filepath.Join(candidatePath, modelFile)); err != nil {
+		http.Error(w, fmt.Sprintf("candidate not found at %s: %v", candidatePath, err),
+			http.StatusBadRequest)
+		return
+	}
+
+	newB, err := loadBundleFromPath(candidatePath, req.CandidateVersion)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("load candidate: %v", err), http.StatusInternalServerError)
+		return
+	}
+	s.bundleB.Store(newB)
+	s.splitPercent.Store(0) // start safe — admin must set split explicitly
+	s.cache.Clear()
+
+	log.Printf("✓ A/B setup: B=%s loaded, split=0%%", newB.version)
+
+	out := map[string]string{"status": "ok", "candidate_version": newB.version}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+type abSplitReq struct {
+	Percent int `json:"percent"`
+}
+
+func (s *Server) handleABSplit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req abSplitReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Percent < 0 || req.Percent > 100 {
+		http.Error(w, "percent must be 0-100", http.StatusBadRequest)
+		return
+	}
+	if s.bundleB.Load() == nil {
+		http.Error(w, "no candidate loaded — call /admin/ab/setup first", http.StatusBadRequest)
+		return
+	}
+
+	s.splitPercent.Store(int32(req.Percent))
+	log.Printf("✓ A/B split set to %d%%", req.Percent)
+
+	out := map[string]interface{}{"status": "ok", "split_percent": req.Percent}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+func (s *Server) handleABPromote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	s.abMu.Lock()
+	defer s.abMu.Unlock()
+
+	b := s.bundleB.Load()
+	if b == nil {
+		http.Error(w, "no candidate to promote", http.StatusBadRequest)
+		return
+	}
+	oldA := s.bundleA.Load()
+
+	s.bundleA.Store(b)
+	s.bundleB.Store(nil)
+	s.splitPercent.Store(0)
+	s.cache.Clear()
+
+	log.Printf("✓ A/B promote: A %s → %s, B cleared", oldA.version, b.version)
+
+	go func(old *modelBundle) {
+		time.Sleep(50 * time.Millisecond)
+		old.Destroy()
+	}(oldA)
+
+	out := map[string]string{"status": "ok", "promoted_to_a": b.version, "old_a_version": oldA.version}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+func (s *Server) handleABAbort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	s.abMu.Lock()
+	defer s.abMu.Unlock()
+
+	b := s.bundleB.Load()
+	if b == nil {
+		http.Error(w, "no candidate to abort", http.StatusBadRequest)
+		return
+	}
+
+	s.bundleB.Store(nil)
+	s.splitPercent.Store(0)
+	s.cache.Clear()
+
+	log.Printf("✓ A/B abort: B=%s destroyed, split=0%%", b.version)
+
+	go func(old *modelBundle) {
+		time.Sleep(50 * time.Millisecond)
+		old.Destroy()
+	}(b)
+
+	out := map[string]string{"status": "ok", "aborted_version": b.version}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+func (s *Server) handleABStatus(w http.ResponseWriter, r *http.Request) {
+	a := s.bundleA.Load()
+	predA := s.predictionsA.Load()
+	predB := s.predictionsB.Load()
+	blocksA := s.blocksA.Load()
+	blocksB := s.blocksB.Load()
+
+	blockRateA := 0.0
+	blockRateB := 0.0
+	if predA > 0 {
+		blockRateA = float64(blocksA) / float64(predA)
+	}
+	if predB > 0 {
+		blockRateB = float64(blocksB) / float64(predB)
+	}
+
 	out := map[string]interface{}{
-		"status":      "ok",
-		"old_version": oldBundle.version,
-		"new_version": newBundle.version,
+		"version_a":      a.version,
+		"predictions_a":  predA,
+		"blocks_a":       blocksA,
+		"block_rate_a":   blockRateA,
+		"split_percent":  s.splitPercent.Load(),
+		"ab_active":      s.bundleB.Load() != nil,
+		"predictions_b":  predB,
+		"blocks_b":       blocksB,
+		"block_rate_b":   blockRateB,
+	}
+	if b := s.bundleB.Load(); b != nil {
+		out["version_b"] = b.version
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
@@ -569,15 +842,13 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"cache_misses":   misses,
 		"cache_hit_rate": hitRate,
 		"cache_size":     s.cache.Size(),
-		"cache_capacity": cacheCapacity,
-		"cache_ttl_ms":   cacheTTL.Milliseconds(),
-		"reload_count":   s.reloadCount.Load(),
-		"model_version":  s.bundle.Load().version,
+		"predictions_a":  s.predictionsA.Load(),
+		"predictions_b":  s.predictionsB.Load(),
+		"ab_active":      s.bundleB.Load() != nil,
+		"split_percent":  s.splitPercent.Load(),
 		"uptime_seconds": uptime,
 		"avg_rps":        rps,
 		"threshold":      s.threshold,
-		"max_batch":      maxBatch,
-		"max_wait_ms":    maxWait.Milliseconds(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
