@@ -1,21 +1,21 @@
 // Sentinel — fraud detection serving layer.
 //
-// Day 5: request batching. A single dedicated goroutine owns the ONNX
-// session. HTTP handlers don't touch it directly — they enqueue jobs
-// onto a channel and wait for results. The batcher collects up to
-// maxBatch requests or waits maxWait, then runs them through the model
-// in a single ONNX call.
-//
-// Trade-off: a few ms added to per-request latency in exchange for much
-// higher throughput on the model.
+// Day 6: LRU prediction cache + TTL on top of Day 5's request batching.
+// Cache key = FNV-1a hash of the 30 feature floats. Cache hits skip the
+// batcher entirely — microsecond response vs milliseconds for the model.
 package main
 
 import (
+	"container/list"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
+	"math"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,10 +29,14 @@ const (
 	numFeatures      = 30
 	httpAddr         = ":8080"
 
-	// Batching parameters.
+	// Batching.
 	maxBatch     = 32
 	maxWait      = 5 * time.Millisecond
 	jobQueueSize = 256
+
+	// Cache.
+	cacheCapacity = 10000
+	cacheTTL      = 2 * time.Second
 )
 
 // -------------------- types --------------------
@@ -55,16 +59,15 @@ type PredictResponse struct {
 	Decision         string  `json:"decision"`
 	ThresholdUsed    float64 `json:"threshold_used"`
 	LatencyMicros    int64   `json:"latency_us"`
-	BatchSize        int     `json:"batch_size"` // how many requests were in this batch
+	BatchSize        int     `json:"batch_size"`
+	CacheHit         bool    `json:"cache_hit"`
 }
 
-// inferenceJob is what HTTP handlers push onto the batcher.
 type inferenceJob struct {
 	features []float32
 	reply    chan inferenceResult
 }
 
-// inferenceResult is what the batcher returns to each handler.
 type inferenceResult struct {
 	fraudProba float32
 	class      int64
@@ -72,30 +75,129 @@ type inferenceResult struct {
 	err        error
 }
 
+// -------------------- LRU cache --------------------
+
+type cacheEntry struct {
+	key       uint64
+	proba     float32
+	class     int64
+	expiresAt time.Time
+}
+
+// LRUCache: map + doubly-linked list. O(1) get/put.
+// Mutex-protected because /predict handlers run concurrently.
+type LRUCache struct {
+	mu       sync.Mutex
+	capacity int
+	ttl      time.Duration
+	items    map[uint64]*list.Element
+	order    *list.List // front = MRU, back = LRU
+}
+
+func NewLRUCache(capacity int, ttl time.Duration) *LRUCache {
+	return &LRUCache{
+		capacity: capacity,
+		ttl:      ttl,
+		items:    make(map[uint64]*list.Element, capacity),
+		order:    list.New(),
+	}
+}
+
+func (c *LRUCache) Get(key uint64) (*cacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	elem, ok := c.items[key]
+	if !ok {
+		return nil, false
+	}
+	entry := elem.Value.(*cacheEntry)
+	if time.Now().After(entry.expiresAt) {
+		// expired — evict
+		c.order.Remove(elem)
+		delete(c.items, key)
+		return nil, false
+	}
+	c.order.MoveToFront(elem)
+	return entry, true
+}
+
+func (c *LRUCache) Put(key uint64, proba float32, class int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if elem, ok := c.items[key]; ok {
+		entry := elem.Value.(*cacheEntry)
+		entry.proba = proba
+		entry.class = class
+		entry.expiresAt = time.Now().Add(c.ttl)
+		c.order.MoveToFront(elem)
+		return
+	}
+
+	entry := &cacheEntry{
+		key:       key,
+		proba:     proba,
+		class:     class,
+		expiresAt: time.Now().Add(c.ttl),
+	}
+	elem := c.order.PushFront(entry)
+	c.items[key] = elem
+
+	// evict LRU if over capacity
+	if c.order.Len() > c.capacity {
+		oldest := c.order.Back()
+		if oldest != nil {
+			oldEntry := oldest.Value.(*cacheEntry)
+			delete(c.items, oldEntry.key)
+			c.order.Remove(oldest)
+		}
+	}
+}
+
+func (c *LRUCache) Size() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.order.Len()
+}
+
+// hashFeatures: FNV-1a over the IEEE-754 bytes of the 30 floats.
+// Fast, non-cryptographic, deterministic — identical floats produce
+// identical bytes produce identical hash.
+func hashFeatures(features []float32) uint64 {
+	h := fnv.New64a()
+	buf := make([]byte, 4)
+	for _, f := range features {
+		binary.LittleEndian.PutUint32(buf, math.Float32bits(f))
+		h.Write(buf)
+	}
+	return h.Sum64()
+}
+
 // -------------------- server --------------------
 
 type Server struct {
 	jobs      chan inferenceJob
 	threshold float64
+	cache     *LRUCache
 
-	// metrics
 	totalRequests atomic.Uint64
 	totalAllow    atomic.Uint64
 	totalBlock    atomic.Uint64
 	totalErrors   atomic.Uint64
-	batchCount    atomic.Uint64 // how many batches the batcher has run
+	batchCount    atomic.Uint64
+	cacheHits     atomic.Uint64
+	cacheMisses   atomic.Uint64
 	startedAt     time.Time
 }
 
 func main() {
-	// 1. Threshold config.
 	cfg, err := loadThresholdConfig(thresholdCfgPath)
 	if err != nil {
 		log.Fatalf("load threshold config: %v", err)
 	}
 	log.Printf("✓ Threshold config loaded: optimal=%.3f", cfg.OptimalThreshold)
 
-	// 2. ONNX runtime init.
 	ort.SetSharedLibraryPath(onnxRuntimeLib)
 	if err := ort.InitializeEnvironment(); err != nil {
 		log.Fatalf("init onnxruntime: %v", err)
@@ -103,17 +205,16 @@ func main() {
 	defer ort.DestroyEnvironment()
 	log.Println("✓ ONNX Runtime initialized")
 
-	// 3. Server state.
 	s := &Server{
 		jobs:      make(chan inferenceJob, jobQueueSize),
 		threshold: cfg.OptimalThreshold,
+		cache:     NewLRUCache(cacheCapacity, cacheTTL),
 		startedAt: time.Now(),
 	}
+	log.Printf("✓ LRU cache ready: capacity=%d TTL=%v", cacheCapacity, cacheTTL)
 
-	// 4. Start the batcher goroutine. It owns the ONNX session.
 	go s.batcher()
 
-	// 5. HTTP server.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/predict", s.handlePredict)
 	mux.HandleFunc("/health", s.handleHealth)
@@ -128,13 +229,13 @@ func main() {
 
 // -------------------- batcher --------------------
 
-// batcher runs in its own goroutine. It owns the ONNX session, accumulates
-// inference jobs from s.jobs, and runs them in batches.
 func (s *Server) batcher() {
-	// Set up the ONNX session for a *batch*. Input shape (maxBatch, 30),
-	// outputs (maxBatch,) and (maxBatch, 2). We always feed maxBatch rows;
-	// when the real batch is smaller, the unused rows just get computed
-	// and ignored. Slightly wasteful but keeps the code simple.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("BATCHER PANIC: %v", r)
+		}
+	}()
+
 	inputTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(maxBatch, numFeatures))
 	if err != nil {
 		log.Fatalf("batcher: create input tensor: %v", err)
@@ -168,21 +269,19 @@ func (s *Server) batcher() {
 
 	log.Println("✓ Batcher goroutine ready, ONNX session bound")
 
-	// Reusable scratch space.
 	batch := make([]inferenceJob, 0, maxBatch)
-	inputData := inputTensor.GetData() // shape (maxBatch * numFeatures,)
+	inputData := inputTensor.GetData()
 
 	for {
-		// Block waiting for the first job in a new batch.
 		first, ok := <-s.jobs
 		if !ok {
-			return // channel closed; shutdown
+			return
 		}
 		batch = batch[:0]
 		batch = append(batch, first)
 
-		// Now collect more jobs until we hit maxBatch or maxWait.
-		deadline := time.NewTimer(maxWait)
+		deadline := time.After(maxWait)
+
 	collect:
 		for len(batch) < maxBatch {
 			select {
@@ -191,41 +290,35 @@ func (s *Server) batcher() {
 					break collect
 				}
 				batch = append(batch, j)
-			case <-deadline.C:
+			case <-deadline:
 				break collect
 			}
 		}
-		deadline.Stop()
 
-		// Pack features into the input tensor.
-		// Each row is numFeatures floats, contiguous.
 		for i, j := range batch {
 			copy(inputData[i*numFeatures:(i+1)*numFeatures], j.features)
 		}
-		// Zero out any remaining rows (defensive — model still computes
-		// them, but we won't read those outputs).
 		for i := len(batch); i < maxBatch; i++ {
 			for k := 0; k < numFeatures; k++ {
 				inputData[i*numFeatures+k] = 0
 			}
 		}
 
-		// Run inference on the full batch.
 		if err := session.Run(); err != nil {
 			result := inferenceResult{err: err}
 			for _, j := range batch {
 				j.reply <- result
 			}
+			log.Printf("batcher: inference error: %v", err)
 			continue
 		}
 
-		// Extract outputs and dispatch back to each waiting handler.
-		labels := labelTensor.GetData() // length maxBatch
-		probas := probaTensor.GetData() // length maxBatch*2
+		labels := labelTensor.GetData()
+		probas := probaTensor.GetData()
 		batchSize := len(batch)
 		for i, j := range batch {
 			j.reply <- inferenceResult{
-				fraudProba: probas[i*2+1], // column 1 = P(fraud)
+				fraudProba: probas[i*2+1],
 				class:      labels[i],
 				batchSize:  batchSize,
 			}
@@ -256,23 +349,43 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
+	key := hashFeatures(req.Features)
 
-	// Submit to the batcher and wait for result.
-	reply := make(chan inferenceResult, 1)
-	s.jobs <- inferenceJob{features: req.Features, reply: reply}
-	result := <-reply
+	var fraudProba float32
+	var predictedClass int64
+	var batchSize int
+	var cacheHit bool
 
-	if result.err != nil {
-		s.totalErrors.Add(1)
-		log.Printf("inference error: %v", result.err)
-		http.Error(w, "inference failed", http.StatusInternalServerError)
-		return
+	// 1. Cache lookup.
+	if entry, ok := s.cache.Get(key); ok {
+		fraudProba = entry.proba
+		predictedClass = entry.class
+		cacheHit = true
+		batchSize = 0
+		s.cacheHits.Add(1)
+	} else {
+		// 2. Cache miss — go through batcher.
+		s.cacheMisses.Add(1)
+		reply := make(chan inferenceResult, 1)
+		s.jobs <- inferenceJob{features: req.Features, reply: reply}
+		result := <-reply
+		if result.err != nil {
+			s.totalErrors.Add(1)
+			log.Printf("inference error: %v", result.err)
+			http.Error(w, "inference failed", http.StatusInternalServerError)
+			return
+		}
+		fraudProba = result.fraudProba
+		predictedClass = result.class
+		batchSize = result.batchSize
+		// Populate cache.
+		s.cache.Put(key, fraudProba, predictedClass)
 	}
 
 	latencyMicros := time.Since(start).Microseconds()
 
 	decision := "allow"
-	if float64(result.fraudProba) >= s.threshold {
+	if float64(fraudProba) >= s.threshold {
 		decision = "block"
 		s.totalBlock.Add(1)
 	} else {
@@ -281,12 +394,13 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 	s.totalRequests.Add(1)
 
 	resp := PredictResponse{
-		FraudProbability: result.fraudProba,
-		PredictedClass:   result.class,
+		FraudProbability: fraudProba,
+		PredictedClass:   predictedClass,
 		Decision:         decision,
 		ThresholdUsed:    s.threshold,
 		LatencyMicros:    latencyMicros,
-		BatchSize:        result.batchSize,
+		BatchSize:        batchSize,
+		CacheHit:         cacheHit,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -301,14 +415,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	uptime := time.Since(s.startedAt).Seconds()
 	total := s.totalRequests.Load()
 	batches := s.batchCount.Load()
+	hits := s.cacheHits.Load()
+	misses := s.cacheMisses.Load()
 
 	rps := 0.0
 	avgBatch := 0.0
+	hitRate := 0.0
 	if uptime > 0 {
 		rps = float64(total) / uptime
 	}
 	if batches > 0 {
-		avgBatch = float64(total) / float64(batches)
+		avgBatch = float64(misses) / float64(batches)
+	}
+	if hits+misses > 0 {
+		hitRate = float64(hits) / float64(hits+misses)
 	}
 
 	out := map[string]interface{}{
@@ -318,6 +438,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"errors":         s.totalErrors.Load(),
 		"batches_run":    batches,
 		"avg_batch_size": avgBatch,
+		"cache_hits":     hits,
+		"cache_misses":   misses,
+		"cache_hit_rate": hitRate,
+		"cache_size":     s.cache.Size(),
+		"cache_capacity": cacheCapacity,
+		"cache_ttl_ms":   cacheTTL.Milliseconds(),
 		"uptime_seconds": uptime,
 		"avg_rps":        rps,
 		"threshold":      s.threshold,
