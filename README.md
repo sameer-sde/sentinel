@@ -1,16 +1,4 @@
-
-
-## Screenshots
-
-Real screenshots from an actual running instance — not mockups.
-
-**Live dashboard** — real-time RPS chart, drift detection firing on live traffic, A/B test active:
-
-![Sentinel live dashboard with drift detection and A/B test active](dashboard/screenshots/dashboard-live.png)
-
-**A/B variant comparison** — Variant A vs Variant B live prediction counts, model config, and load tester panel:
-
-![Sentinel A/B test variant comparison](dashboard/screenshots/ab-test-variants.png)# Sentinel — Real-time fraud detection serving system
+# Sentinel — Real-time fraud detection serving system
 
 End-to-end ML serving system. Python trains an XGBoost fraud classifier
 on 284k credit-card transactions; Go loads the exported ONNX model and
@@ -183,6 +171,25 @@ Returns:
 See [sentinel-dashboard](https://github.com/sameer-sde/sentinel-dashboard) for the React UI.
 Run `npm install && npm run dev` and open `http://localhost:5173`.
 
+### Proof: live traffic, captured end-to-end
+
+These are real screenshots from an actual running server on a laptop —
+not mockups. Together they show live traffic hitting the model, drift
+detection firing on real data, and a genuine A/B test comparing two
+model versions.
+
+**1. Live dashboard** — real-time RPS chart with traffic spikes, drift
+detection actively flagging shifted features, A/B test running at a 50%
+split:
+
+[![Sentinel live dashboard with drift detection and A/B test active](dashboard/screenshots/dashboard-live.png)](dashboard/screenshots/dashboard-live.png)
+
+**2. A/B variant comparison** — Variant A and Variant B each show live,
+independent prediction counts and block rates, plus the model config
+panel (threshold, allow/block totals, batches run):
+
+[![Sentinel A/B test variant comparison](dashboard/screenshots/ab-test-variants.png)](dashboard/screenshots/ab-test-variants.png)
+
 ## API
 
 ### Public
@@ -195,7 +202,7 @@ Run `npm install && npm run dev` and open `http://localhost:5173`.
 
 ### Admin
 | Method | Path                    | Body                              | Purpose                          |
-|--------|-------------------------|-----------------------------------|----------------------------------|
+|--------|-------------------------|-----------------------------------|-----------------------------------|
 | GET    | `/admin/version`        | -                                 | Current A (+ B if any)           |
 | POST   | `/admin/reload`         | -                                 | Re-read `models/current` symlink |
 | GET    | `/admin/drift`          | -                                 | Per-feature drift report         |
