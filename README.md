@@ -213,3 +213,31 @@ panel (threshold, allow/block totals, batches run):
 | GET    | `/admin/ab/status`      | -                                 | A/B state + per-variant counts   |
 
 ## A/B test workflow
+
+A full canary deployment cycle, using the admin endpoints above:
+
+1. **Train a challenger model** and place it at `models/v2/` (same
+   process as the `01_baseline.py` → `04_export_onnx.py` steps above).
+
+2. **Load it as candidate B**:
+   ```bash
+   curl -X POST http://localhost:8080/admin/ab/setup \
+     -d '{"candidate_version": "v2"}'
+   ```
+
+3. **Send it a slice of live traffic** — start small and increase once confident:
+   ```bash
+   curl -X POST http://localhost:8080/admin/ab/split -d '{"percent": 25}'
+   ```
+
+4. **Watch the comparison live** via the dashboard, or poll directly:
+   ```bash
+   curl http://localhost:8080/admin/ab/status
+   ```
+
+5. **Decide the outcome**:
+   - If B performs better: `curl -X POST http://localhost:8080/admin/ab/promote`
+   - If B underperforms: `curl -X POST http://localhost:8080/admin/ab/abort`
+
+No downtime, no dropped requests, and traffic can be scaled up or down at
+any point before the final decision.
