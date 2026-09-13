@@ -1,4 +1,16 @@
-# Sentinel — Real-time fraud detection serving system
+
+
+## Screenshots
+
+Real screenshots from an actual running instance — not mockups.
+
+**Live dashboard** — real-time RPS chart, drift detection firing on live traffic, A/B test active:
+
+![Sentinel live dashboard with drift detection and A/B test active](dashboard/screenshots/dashboard-live.png)
+
+**A/B variant comparison** — Variant A vs Variant B live prediction counts, model config, and load tester panel:
+
+![Sentinel A/B test variant comparison](dashboard/screenshots/ab-test-variants.png)# Sentinel — Real-time fraud detection serving system
 
 End-to-end ML serving system. Python trains an XGBoost fraud classifier
 on 284k credit-card transactions; Go loads the exported ONNX model and
